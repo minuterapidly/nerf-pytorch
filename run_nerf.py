@@ -677,10 +677,14 @@ def train():
     if use_batching:
         # For random ray batching
         print('get rays')
+        # get_rays_np 获取每条光束的起点和方向ro和rd,应该每个像素值都有一条光线  p是相机的位姿，通常是一个 3x4 的矩阵
         rays = np.stack([get_rays_np(H, W, K, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
         print('done, concats')
+        # images: 形状为 [N, H, W, 3] images[:, None]通过[:, None] 添加一个维度，变成形状为 [N, 1, H, W, 3]
+        # 应该ro+rd+rgb就是3吧
         rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
         rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
+        #  [N_train, H, W, ro+rd+rgb, 3]
         rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
         rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
         rays_rgb = rays_rgb.astype(np.float32)
@@ -714,8 +718,11 @@ def train():
         # Sample random ray batch
         if use_batching:
             # Random over all images
+             # [N_train*H*W, ro+rd+rgb, 3]->[N_train*H*W, 3, 3]
             batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
+            # [N_train*H*W, 3, 3]->[3,N_train*H*W, 3]
             batch = torch.transpose(batch, 0, 1)
+            # 前两个是光线ro和rd 最后一个是像素值
             batch_rays, target_s = batch[:2], batch[2]
 
             i_batch += N_rand
@@ -757,10 +764,12 @@ def train():
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
+        # 渲染
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
 
+        # 计算与gt的损失，反向传播
         optimizer.zero_grad()
         img_loss = img2mse(rgb, target_s)
         trans = extras['raw'][...,-1]
