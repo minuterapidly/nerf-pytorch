@@ -108,6 +108,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
         viewdirs = viewdirs / torch.norm(viewdirs, dim=-1, keepdim=True)
         viewdirs = torch.reshape(viewdirs, [-1,3]).float()
 
+    # [N 3]
     sh = rays_d.shape # [..., 3]
     if ndc:
         # for forward facing scenes
@@ -117,7 +118,9 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     rays_o = torch.reshape(rays_o, [-1,3]).float()
     rays_d = torch.reshape(rays_d, [-1,3]).float()
 
+    #  rays_o [N,3]  rays_d [N,3] near, far [N,1]
     near, far = near * torch.ones_like(rays_d[...,:1]), far * torch.ones_like(rays_d[...,:1])
+    #  rays  [N,3+3+1+1]-> [N,8]
     rays = torch.cat([rays_o, rays_d, near, far], -1)
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
@@ -198,6 +201,7 @@ def create_nerf(args):
                           input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs).to(device)
         grad_vars += list(model_fine.parameters())
 
+    # inputs形状 [N_rays, N_samples, 3]
     network_query_fn = lambda inputs, viewdirs, network_fn : run_network(inputs, viewdirs, network_fn,
                                                                 embed_fn=embed_fn,
                                                                 embeddirs_fn=embeddirs_fn,
@@ -348,12 +352,13 @@ def render_rays(ray_batch,
       z_std: [num_rays]. Standard deviation of distances along ray for each
         sample.
     """
+    # 从输入batch中取出 光线数量，光线起始点和方向，远近边界
     N_rays = ray_batch.shape[0]
     rays_o, rays_d = ray_batch[:,0:3], ray_batch[:,3:6] # [N_rays, 3] each
     viewdirs = ray_batch[:,-3:] if ray_batch.shape[-1] > 8 else None
     bounds = torch.reshape(ray_batch[...,6:8], [-1,1,2])
     near, far = bounds[...,0], bounds[...,1] # [-1,1]
-
+    # 确定每条光线的采样点
     t_vals = torch.linspace(0., 1., steps=N_samples)
     if not lindisp:
         z_vals = near * (1.-t_vals) + far * (t_vals)
@@ -378,6 +383,7 @@ def render_rays(ray_batch,
 
         z_vals = lower + (upper - lower) * t_rand
 
+    # 计算每个采样点的位置 [N_rays, N_samples, 3]
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
 
@@ -728,20 +734,26 @@ def train():
             i_batch += N_rand
             if i_batch >= rays_rgb.shape[0]:
                 print("Shuffle data after an epoch!")
+                # N为光线数据数量的话，生成一个0-N的随机索引序列
                 rand_idx = torch.randperm(rays_rgb.shape[0])
+                # 根据随机索引序列重新排列光线数据
                 rays_rgb = rays_rgb[rand_idx]
+                # 重新从0开始
                 i_batch = 0
 
         else:
             # Random from one image
+            # 没有用batch，随机选一张图像
             img_i = np.random.choice(i_train)
             target = images[img_i]
             target = torch.Tensor(target).to(device)
+            # 相机位姿
             pose = poses[img_i, :3,:4]
 
             if N_rand is not None:
+                # 获取每个像素的光线ro rd  分别是一个点和一个方向，所以都是三维
                 rays_o, rays_d = get_rays(H, W, K, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
-
+                # 在中间裁剪一个区域
                 if i < args.precrop_iters:
                     dH = int(H//2 * args.precrop_frac)
                     dW = int(W//2 * args.precrop_frac)
@@ -753,18 +765,25 @@ def train():
                     if i == start:
                         print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
                 else:
+                    # 使用全部的像素坐标
                     coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
 
+                # (H * W, 2)
                 coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
                 select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
                 select_coords = coords[select_inds].long()  # (N_rand, 2)
+                # select_coords (N_rand, 2)  rays_o (H, W, 3) rays_d (H, W, 3)
+                # (N_rand, 3) 
                 rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                # (N_rand, 3) +(N_rand, 3) -> (2,N_rand, 3)
                 batch_rays = torch.stack([rays_o, rays_d], 0)
+                # target图像
                 target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
         #####  Core optimization loop  #####
         # 渲染
+        # 返回渲染出的一个batch的rgb，disp（视差图），acc（不透明度）和extras（其他信息）
         rgb, disp, acc, extras = render(H, W, K, chunk=args.chunk, rays=batch_rays,
                                                 verbose=i < 10, retraw=True,
                                                 **render_kwargs_train)
