@@ -23,7 +23,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
 DEBUG = False
 
-
+# 把输入batch每chunk个拼接起来  N,dim [chunk1,dim] [chunk2,dim],...
 def batchify(fn, chunk):
     """Constructs a version of 'fn' that applies to smaller batches.
     """
@@ -37,20 +37,24 @@ def batchify(fn, chunk):
 def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     """Prepares inputs and applies network 'fn'.
     """
+    # (batch_size, num_samples, feature_dim)->(batch_size*num_samples, feature_dim)
     inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
     embedded = embed_fn(inputs_flat)
 
+    # 对视角方向也进行嵌入
     if viewdirs is not None:
         input_dirs = viewdirs[:,None].expand(inputs.shape)
         input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
         embedded_dirs = embeddirs_fn(input_dirs_flat)
+        # 和原始的嵌入拼接
         embedded = torch.cat([embedded, embedded_dirs], -1)
-
+    # 把批次等于netchunk送入mlp函数里
     outputs_flat = batchify(fn, netchunk)(embedded)
+    # (batch_size, num_samples, output_dim)
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
 
-
+# rays_flat 输入 [N,8]
 def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
@@ -61,7 +65,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
             if k not in all_ret:
                 all_ret[k] = []
             all_ret[k].append(ret[k])
-
+    # 每次渲染小批次，最后将所有批次的结果拼接在一起返回
     all_ret = {k : torch.cat(all_ret[k], 0) for k in all_ret}
     return all_ret
 
@@ -101,6 +105,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
 
     if use_viewdirs:
         # provide ray directions as input
+        # 如果没有提供视角方向，就把光照方向作为视角方向
         viewdirs = rays_d
         if c2w_staticcam is not None:
             # special case to visualize effect of viewdirs
@@ -112,6 +117,7 @@ def render(H, W, K, chunk=1024*32, rays=None, c2w=None, ndc=True,
     sh = rays_d.shape # [..., 3]
     if ndc:
         # for forward facing scenes
+        # 坐标转到ndc空间
         rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
 
     # Create ray batch
@@ -262,49 +268,68 @@ def create_nerf(args):
 
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
 
-
+# 输入：[num_rays, num_samples, 4]
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
-    """Transforms model's predictions to semantically meaningful values.
-    Args:
-        raw: [num_rays, num_samples along ray, 4]. Prediction from model.
-        z_vals: [num_rays, num_samples along ray]. Integration time.
-        rays_d: [num_rays, 3]. Direction of each ray.
-    Returns:
-        rgb_map: [num_rays, 3]. Estimated RGB color of a ray.
-        disp_map: [num_rays]. Disparity map. Inverse of depth map.
-        acc_map: [num_rays]. Sum of weights along each ray.
-        weights: [num_rays, num_samples]. Weights assigned to each sampled color.
-        depth_map: [num_rays]. Estimated distance to object.
+    """将模型的预测结果转换为语义意义更强的值。
+    参数：
+        raw: [num_rays, num_samples along ray, 4]。模型的预测结果，包含RGB颜色和透明度（或体积密度）。
+        z_vals: [num_rays, num_samples along ray]。射线上的积分时间（或深度值）。
+        rays_d: [num_rays, 3]。每条射线的方向，通常是单位向量。
+        raw_noise_std: 标量，控制透明度（alpha）的噪声标准差，防止模型过拟合。
+        white_bkgd: 布尔值，表示是否使用白色背景，影响颜色计算。
+        pytest: 布尔值，控制调试时噪声的生成方式。
+    返回：
+        rgb_map: [num_rays, 3]。每条射线的RGB颜色映射。
+        disp_map: [num_rays]。视差图（深度的倒数）。
+        acc_map: [num_rays]。每条射线的累积透明度。
+        weights: [num_rays, num_samples]。每个样本点的权重。
+        depth_map: [num_rays]。每条射线的深度图。
     """
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
+    
+    # 定义一个lambda函数，用来计算透明度（alpha），它是基于体积密度和距离计算的。
+    raw2alpha = lambda raw, dists, act_fn=F.relu: 1. - torch.exp(-act_fn(raw) * dists)
 
-    dists = z_vals[...,1:] - z_vals[...,:-1]
-    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
+    # 计算每个样本的距离值（即射线的相邻样本点之间的距离）
+    dists = z_vals[..., 1:] - z_vals[..., :-1]  # 计算相邻样本的距离
+    dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[..., :1].shape)], -1)  # 补充最后一个样本的距离
 
-    dists = dists * torch.norm(rays_d[...,None,:], dim=-1)
+    # 将距离调整为真实的物理距离，考虑到射线的方向（单位向量）
+    dists = dists * torch.norm(rays_d[..., None, :], dim=-1)  # 乘以射线方向的范数
 
-    rgb = torch.sigmoid(raw[...,:3])  # [N_rays, N_samples, 3]
-    noise = 0.
+    # 通过sigmoid函数将raw的前三个通道（RGB颜色）映射到[0, 1]区间
+    rgb = torch.sigmoid(raw[..., :3])  # [num_rays, num_samples, 3]
+    
+    noise = 0.  # 默认没有噪声
     if raw_noise_std > 0.:
-        noise = torch.randn(raw[...,3].shape) * raw_noise_std
+        noise = torch.randn(raw[..., 3].shape) * raw_noise_std  # 生成噪声
 
-        # Overwrite randomly sampled data if pytest
+        # 如果是pytest模式，则使用固定的噪声值
         if pytest:
-            np.random.seed(0)
-            noise = np.random.rand(*list(raw[...,3].shape)) * raw_noise_std
-            noise = torch.Tensor(noise)
+            np.random.seed(0)  # 固定随机种子，确保噪声一致
+            noise = np.random.rand(*list(raw[..., 3].shape)) * raw_noise_std  # 使用numpy生成噪声
+            noise = torch.Tensor(noise)  # 转换为tensor
 
-    alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
-    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
-    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
-    rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
+    # 计算透明度（alpha），透明度受体积密度和噪声的影响
+    alpha = raw2alpha(raw[..., 3] + noise, dists)  # [num_rays, num_samples]
 
-    depth_map = torch.sum(weights * z_vals, -1)
-    disp_map = 1./torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))
-    acc_map = torch.sum(weights, -1)
+    # 计算每个样本的权重，权重是透明度与前一权重的乘积
+    weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1. - alpha + 1e-10], -1), -1)[:, :-1]  # [num_rays, num_samples]
 
+    # 计算每条射线的最终颜色，通过加权平均得到
+    rgb_map = torch.sum(weights[..., None] * rgb, -2)  # [num_rays, 3]，RGB颜色加权平均
+
+    # 计算每条射线的深度图，通过权重加权z_vals得到
+    depth_map = torch.sum(weights * z_vals, -1)  # [num_rays]，加权平均深度
+
+    # 计算每条射线的视差图（深度的倒数），避免除零错误
+    disp_map = 1. / torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, -1))  # [num_rays]，深度的倒数
+
+    # 计算每条射线的累积透明度，表示射线的总透光性
+    acc_map = torch.sum(weights, -1)  # [num_rays]，累计透明度
+
+    # 如果使用白色背景，调整颜色映射
     if white_bkgd:
-        rgb_map = rgb_map + (1.-acc_map[...,None])
+        rgb_map = rgb_map + (1. - acc_map[..., None])  # 白色背景的处理
 
     return rgb_map, disp_map, acc_map, weights, depth_map
 
@@ -364,7 +389,7 @@ def render_rays(ray_batch,
         z_vals = near * (1.-t_vals) + far * (t_vals)
     else:
         z_vals = 1./(1./near * (1.-t_vals) + 1./far * (t_vals))
-
+    # z_vals应该就是采样点的深度 在near和far之间
     z_vals = z_vals.expand([N_rays, N_samples])
 
     if perturb > 0.:
@@ -388,7 +413,9 @@ def render_rays(ray_batch,
 
 
 #     raw = run_network(pts)
+    # 输入输出 [N_rays, N_samples, 3]->[N_rays, N_samples, output_dim]
     raw = network_query_fn(pts, viewdirs, network_fn)
+                    
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
