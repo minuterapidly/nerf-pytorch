@@ -94,8 +94,13 @@ class NeRF(nn.Module):
             self.output_linear = nn.Linear(W, output_ch)
 
     def forward(self, x):
+        # 把输入划分为点和视图 维度分别是 input_pts:[N,input_ch]  input_views:[N,input_ch_views]
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
+        # [N,input_ch]
         h = input_pts
+        # 遍历nn.ModuleList里的每一层
+        # input_ch -> W 第一层
+        # 后续 W->W 8层MLP  或者有跳跃连接 最后输出[N,W]
         for i, l in enumerate(self.pts_linears):
             h = self.pts_linears[i](h)
             h = F.relu(h)
@@ -103,17 +108,23 @@ class NeRF(nn.Module):
                 h = torch.cat([input_pts, h], -1)
 
         if self.use_viewdirs:
+            # [N,W]->[N,1]  预测的透明度alpha [N,1]
             alpha = self.alpha_linear(h)
+            # [N,W]->[N,W]
             feature = self.feature_linear(h)
+            # [N,W]+[N,input_ch_views]->[N,input_ch_views+W]
             h = torch.cat([feature, input_views], -1)
         
             for i, l in enumerate(self.views_linears):
+                # [N,input_ch_views+W]->[N,W//2]
                 h = self.views_linears[i](h)
                 h = F.relu(h)
-
+            # [N,W//2]->[N,3] 预测的RGB颜色值 [N,3] 
             rgb = self.rgb_linear(h)
+            # 将输出拼接起来 [N,4]
             outputs = torch.cat([rgb, alpha], -1)
         else:
+            # [N,W]->[N,output_ch]
             outputs = self.output_linear(h)
 
         return outputs    
